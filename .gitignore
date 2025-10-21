@@ -2,3 +2,5 @@ venv/
 input/*.pdf
 combined_output.txt
 pdf_extraction.log
+*.jsonl
+*.tmp
