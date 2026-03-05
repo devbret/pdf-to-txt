@@ -15,6 +15,10 @@ from itertools import repeat
 
 _LOG_PATH: Optional[Path] = None
 _VERBOSE: bool = False
+_pypdf_import_error: Optional[str] = None
+_pdfminer_import_error: Optional[str] = None
+_ocr_import_error: Optional[str] = None
+_tqdm_import_error: Optional[str] = None
 
 def _maybe_setup_child_logging() -> None:
     global _LOG_PATH, _VERBOSE
@@ -35,17 +39,22 @@ try:
     from pypdf import PdfReader as _PdfReader
     PdfReader = _PdfReader
 except Exception:
+    import traceback
+    _pypdf_import_error = traceback.format_exc()
     try:
         from PyPDF2 import PdfReader as _PdfReader
         PdfReader = _PdfReader
     except Exception:
+        _pypdf_import_error += "\n" + traceback.format_exc()
         PdfReader = None
 
 _pdfminer_extract_text: Optional[Callable[..., str]] = None
 try:
     from pdfminer.high_level import extract_text as _pdfminer_extract_text
 except Exception:
+    import traceback
     _pdfminer_extract_text = None
+    _pdfminer_import_error = traceback.format_exc()
 
 _ocr_available = True
 try:
@@ -53,14 +62,18 @@ try:
     import pytesseract
     from PIL import Image
 except Exception:
+    import traceback
     _ocr_available = False
+    _ocr_import_error = traceback.format_exc()
 
 _use_tqdm = False
 try:
     from tqdm import tqdm
     _use_tqdm = True
 except Exception:
+    import traceback
     _use_tqdm = False
+    _tqdm_import_error = traceback.format_exc()
 
 LOG_DEFAULT = "pdf_extraction.log"
 OUTPUT_DEFAULT = "combined_output.txt"
@@ -95,6 +108,20 @@ def setup_logging(log_file: Path, verbose: bool) -> None:
         handlers.append(logging.StreamHandler())
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, format="%(asctime)s [%(processName)s %(levelname)s] %(message)s", handlers=handlers)
     logging.info("Logging initialized -> %s (verbose=%s)", log_file, verbose)
+    def _handle_uncaught(exc_type, exc_value, exc_tb):
+        logging.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+    sys.excepthook = _handle_uncaught
+
+    if _pdfminer_import_error:
+        logging.warning("Optional dependency pdfminer.six not available. Import error:\n%s", _pdfminer_import_error)
+        logging.debug("To enable: pip install pdfminer.six")
+    if _ocr_import_error:
+        logging.warning("Optional OCR stack not available. Import error:\n%s", _ocr_import_error)
+        logging.debug("To enable OCR: pip install pdf2image pytesseract pillow; ensure tesseract is installed system-wide")
+    if _pypdf_import_error:
+        logging.warning("pypdf/PyPDF2 import issues encountered during startup. Details:\n%s", _pypdf_import_error)
+    if _tqdm_import_error:
+        logging.debug("tqdm not available (progress bar disabled): %s", _tqdm_import_error)
 
 def discover_pdfs(root: Path, recursive: bool, pattern: str) -> List[Path]:
     t0 = time.perf_counter()
@@ -173,7 +200,7 @@ def extract_with_pypdf(pdf_path: Path, page_numbers_1based: Optional[List[int]],
                 reader.decrypt("")
                 logging.debug("Tried empty-password decrypt for %s", pdf_path.name)
             except Exception as e:
-                logging.debug("Empty-password decrypt failed for %s: %s", pdf_path.name, e)
+                logging.debug("Empty-password decrypt failed for %s", pdf_path.name, exc_info=True)
         total = len(reader.pages)
         pages = [p - 1 for p in page_numbers_1based if 1 <= p <= total] if page_numbers_1based else range(total)
         for idx in pages:
@@ -181,7 +208,7 @@ def extract_with_pypdf(pdf_path: Path, page_numbers_1based: Optional[List[int]],
                 t = reader.pages[idx].extract_text() or ""
                 text_parts.append(t + ("\f" if keep_formfeed else ""))
             except Exception as e:
-                logging.warning("Failed to extract page %s of %s: %s", idx + 1, pdf_path.name, e)
+                logging.warning("Failed to extract page %s of %s", idx + 1, pdf_path.name, exc_info=True)
     dt = (time.perf_counter() - t0) * 1000
     logging.debug("pypdf extracted %s in %.1f ms", pdf_path.name, dt)
     return "".join(text_parts)
@@ -225,7 +252,7 @@ def extract_text_from_pdf(pdf_path: Path, engine: str, keep_formfeed: bool, try_
                     reader = PdfReader(fh)
                     total_pages_known = len(reader.pages)
             except Exception as e:
-                logging.debug("Failed to pre-read page count for %s: %s", pdf_path.name, e)
+                logging.debug("Failed to pre-read page count for %s", pdf_path.name, exc_info=True)
         pages = total_pages_known or 0
         pages_1based = resolve_page_numbers(requested_pages_1based, pages) if pages else requested_pages_1based
         if engine == "pdfminer":
@@ -243,7 +270,7 @@ def extract_text_from_pdf(pdf_path: Path, engine: str, keep_formfeed: bool, try_
                 ocr_used = True
             except Exception as e:
                 error_msg = f"OCR failed: {e}"
-                logging.warning("OCR failed for %s: %s", pdf_path.name, e)
+                logging.exception("OCR failed for %s", pdf_path.name)
         norm = normalize_text(extracted, keep_formfeed)
         sha256 = hashlib.sha256(norm.encode("utf-8")).hexdigest() if norm else None
         meta = ExtractionResult(str(pdf_path), True, pages, len(norm), sha256, None if norm.strip() else error_msg or "Empty extraction", engine, ocr_used)
@@ -254,7 +281,7 @@ def extract_text_from_pdf(pdf_path: Path, engine: str, keep_formfeed: bool, try_
         return norm, meta
     except Exception as e:
         dt = (time.perf_counter() - t0) * 1000
-        logging.error("Extraction error for %s after %.1f ms: %s", pdf_path.name, dt, e)
+        logging.exception("Extraction error for %s after %.1f ms", pdf_path.name, dt)
         meta = ExtractionResult(str(pdf_path), False, pages, 0, None, str(e), engine, ocr_used)
         return "", meta
 
@@ -336,7 +363,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pool = futures.ProcessPoolExecutor(max_workers=worker_count)
             iterator = pool.map(handle_one, map(str, pdfs), repeat(config))
         except Exception as e:
-            logging.error("Failed to start ProcessPoolExecutor: %s. Falling back to single worker.", e)
+            logging.exception("Failed to start ProcessPoolExecutor. Falling back to single worker.")
             worker_count = 1
             iterator = (handle_one(str(p), config) for p in pdfs)
 
@@ -355,7 +382,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     path.touch()
                     logging.debug("Per-file placeholder created (empty or failed): %s", path)
             except Exception as e:
-                logging.error("Failed to write per-file output %s: %s", path, e)
+                logging.exception("Failed to write per-file output %s", path)
         if meta.ok and text:
             combined_chunks.append(f"\n\n==== {Path(meta.path).name} ({meta.pages} pages) ====\n\n" + text)
         index_lines.append(json.dumps(asdict(meta), ensure_ascii=False))
@@ -371,7 +398,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.info("Combined output written: %s", output_file)
     except Exception as e:
         print(f"Failed to write combined: {e}")
-        logging.error("Failed to write combined output %s: %s", output_file, e)
+        logging.exception("Failed to write combined output %s", output_file)
 
     if index_path:
         try:
@@ -379,7 +406,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             logging.info("Index JSONL written: %s lines=%d", index_path, len(index_lines))
         except Exception as e:
             print(f"Failed to write index: {e}")
-            logging.error("Failed to write index %s: %s", index_path, e)
+            logging.exception("Failed to write index %s", index_path)
 
     total_ms = (time.perf_counter() - start_all) * 1000
     logging.info("All done. PDFs=%d total_ms=%.1f", len(pdfs), total_ms)
