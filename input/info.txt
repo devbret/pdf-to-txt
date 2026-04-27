@@ -1,1 +1,1 @@
-Put your PDF files in this directory.
+Place your PDF files in this directory.
