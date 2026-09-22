@@ -97,6 +97,7 @@ class WorkerConfig:
     requested_pages_1based: Optional[List[int]]
     enable_ocr: bool
     per_file_out_dir: Optional[str]
+    input_root: Optional[str]
 
 def setup_logging(log_file: Path, verbose: bool) -> None:
     global _LOG_PATH, _VERBOSE
@@ -296,12 +297,25 @@ def extract_text_from_pdf(pdf_path: Path, engine: str, keep_formfeed: bool, try_
         meta = ExtractionResult(str(pdf_path), False, pages, 0, None, str(e), engine, ocr_used)
         return "", meta
 
+def per_file_output_path(pdf_path: Path, out_dir: Path, input_root: Optional[Path]) -> Path:
+    rel = None
+    if input_root is not None:
+        try:
+            rel = pdf_path.resolve().relative_to(input_root.resolve())
+        except (ValueError, OSError):
+            logging.debug("Cannot relativize %s against %s; falling back to hashed name", pdf_path, input_root)
+    if rel is None:
+        digest = hashlib.sha256(str(pdf_path).encode("utf-8")).hexdigest()[:8]
+        return out_dir / f"{pdf_path.stem}-{digest}.txt"
+    return out_dir / rel.with_suffix(".txt")
+
 def handle_one(pdf_path: str, config: WorkerConfig) -> Tuple[str, ExtractionResult, Optional[str]]:
     logging.debug("Worker handling %s", pdf_path)
     text, meta = extract_text_from_pdf(Path(pdf_path), config.engine, config.keep_formfeed, config.try_decrypt_empty, config.requested_pages_1based, config.enable_ocr)
     per_file = None
     if config.per_file_out_dir:
-        per_file = str(Path(config.per_file_out_dir) / (Path(pdf_path).stem + ".txt"))
+        root = Path(config.input_root) if config.input_root else None
+        per_file = str(per_file_output_path(Path(pdf_path), Path(config.per_file_out_dir), root))
     return text, meta, per_file
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -361,7 +375,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     combined_chunks = []
     index_lines = []
-    config = WorkerConfig(args.engine, args.keep_formfeed, args.try_decrypt_empty, requested_pages, args.ocr and _ocr_available, str(per_file_dir) if per_file_dir else None)
+    config = WorkerConfig(args.engine, args.keep_formfeed, args.try_decrypt_empty, requested_pages, args.ocr and _ocr_available, str(per_file_dir) if per_file_dir else None, str(input_dir))
     worker_count = max(1, (os.cpu_count() or 4) if args.workers == 0 else args.workers)
     logging.info("Workers: requested=%s effective=%d", args.workers, worker_count)
 
